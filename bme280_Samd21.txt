@@ -1,0 +1,388 @@
+/***********************************************************************************
+*  Program reads Temperature(C), pressure(Pa) and humidity(RH) from BME280 slave
+*  Communication is 4 Wire SPI on SAMD21
+*  runs in forced/trigger mode
+***********************************************************************************/
+
+
+#include <asf.h>
+#define bme long signed int
+#define ubme long unsigned int
+
+void clockSetup(void);
+void wait(volatile int d);
+void portSetup(void);
+void spiSetup(void);
+void spiWrite(void);
+void compensation_1(void);
+void compensation_2(void);
+void grab_data(void);
+void convert_data(void);
+
+volatile uint8_t array[30];
+volatile uint8_t *array_ptr;
+volatile int cnt = 0;
+volatile int done = 0;
+
+volatile int adc_T= 0;
+volatile int adc_P= 0;
+volatile int adc_H= 0;
+volatile unsigned short dig_T1= 0;
+volatile signed short dig_T2= 0;
+volatile signed short dig_T3= 0;
+volatile unsigned short dig_P1= 0;
+volatile signed short dig_P2= 0;
+volatile signed short dig_P3= 0;
+volatile signed short dig_P4= 0;
+volatile signed short dig_P5= 0;
+volatile signed short dig_P6= 0;
+volatile signed short dig_P7= 0;
+volatile signed short dig_P8= 0;
+volatile signed short dig_P9= 0;
+volatile unsigned char dig_H1= 0;
+volatile signed short dig_H2= 0;
+volatile unsigned char dig_H3= 0;
+volatile signed short dig_H4= 0;
+volatile signed short dig_H5= 0;
+volatile signed char dig_H6= 0;
+volatile int T;
+volatile int p;
+volatile int h;
+
+
+
+int main (void){
+	
+	system_init();
+	clockSetup();
+	portSetup();
+	spiSetup();
+	spiWrite();
+	
+	while(1){}
+}
+
+void clockSetup(void){
+
+	SYSCTRL->INTFLAG.reg = SYSCTRL_INTFLAG_BOD33RDY | SYSCTRL_INTFLAG_BOD33DET | SYSCTRL_INTFLAG_DFLLRDY;
+	SYSCTRL->OSC8M.bit.PRESC = 3;	//divide the clock by 8	so 1MHz still
+	SYSCTRL->OSC8M.bit.ONDEMAND = 1;	//clock is off is no peripheral request
+	SYSCTRL->OSC8M.bit.RUNSTDBY = 0;	//clock is off in sleep mode
+	SYSCTRL->OSC8M.reg |= 1<<1;	//enable clock
+	//SYSCTRL->OSC8M.bit.FRANGE = 2;	//yet another way to control manipulate the clock freq
+	
+	GCLK->CTRL.bit.SWRST = 1;	//reset the generators
+	while (GCLK->STATUS.bit.SYNCBUSY){}	//waiting for the reset to complete
+	
+	GCLK->GENDIV.bit.ID = 0;	//genclk 0 to be divided in next instruction
+	GCLK->GENDIV.bit.DIV = 1;	//divide genclk o by 1
+
+	GCLK->GENCTRL.bit.ID = 0;	//select genclk 0 to be enabled in next instr
+	GCLK->GENCTRL.bit.GENEN = 1; //ENABLE genclk 0
+	GCLK->GENCTRL.bit.OE = 1;	//enable clock as output
+	//GCLK->GENCTRL.bit.SRC = 6;	//choose 8MHz clock as source
+	GCLK->GENCTRL.bit.SRC = 3;	//choose 32KHz clock as source
+	GCLK->GENCTRL.bit.DIVSEL = 0;	//source is not divided
+	//GCLK->GENCTRL.reg |= GCLK_GENCTRL_DIVSEL | GCLK_GENCTRL_GENEN | G
+	
+	while (GCLK->STATUS.bit.SYNCBUSY){}	//waiting for sync to complete
+	GCLK->CLKCTRL.reg |= 0<<14;	//disable clock
+	GCLK->CLKCTRL.reg = GCLK_CLKCTRL_ID_SERCOM0_CORE | GCLK_CLKCTRL_GEN_GCLK0 | 1<<14;	//setup genclk for sercom0
+
+	while (GCLK->STATUS.bit.SYNCBUSY==1){}	//waiting for sync to complete
+	
+	PM->CPUSEL.bit.CPUDIV = 0;	//divide CPU clock by 1	pg 15
+	PM->APBASEL.bit.APBADIV = 0;	//divide apba bus by 1
+	PM->APBBSEL.bit.APBBDIV = 0;	//divide apbb bus by 1
+	PM->APBCSEL.bit.APBCDIV = 0;	//divide apbc bus by 1
+	PM->APBAMASK.reg |= 1<<3;	//enable the GCLK clock DONT THINK NECESSARY they should be enabled by default pg 159
+	PM->APBCMASK.reg |= 1<<2;	//enable the SERCOM0 APB
+	PM->APBCMASK.reg |= PM_APBCMASK_SERCOM4;
+}
+
+void portSetup(void){
+	Port *por = PORT;
+	PortGroup *porA = &(por->Group[0]);
+	
+	/* SPI ports setup */
+	porA->PMUX[2].bit.PMUXE = 3;	//pad0 SDI MOSI
+	porA->PINCFG[4].bit.PMUXEN =1;
+	porA->PMUX[2].bit.PMUXO = 3;	//pad1 SCK
+	porA->PINCFG[5].bit.PMUXEN =1;
+	porA->DIRSET.reg = PORT_PA06;	//SS
+	porA->OUTSET.reg = PORT_PA06;
+	porA->PMUX[3].bit.PMUXO = 3;	//pad3 SDO MISO
+	porA->PINCFG[7].bit.PMUXEN=1;
+}
+
+void spiSetup(void){
+	Sercom *ser = SERCOM0;
+	SercomSpi *spi = &(ser->SPI);
+	spi->CTRLA.reg |= 0<<1;
+	while(spi->SYNCBUSY.reg){}
+	spi->CTRLA.bit.DIPO = 0x3;
+	spi->CTRLA.bit.DORD = 0;
+	spi->CTRLA.bit.DOPO = 0;
+	spi->CTRLA.bit.MODE = 0x3;
+	spi->CTRLB.bit.MSSEN = 0;
+	spi->CTRLB.bit.RXEN = 0;
+	spi->BAUD.reg = 26214; //1200 baud rate
+	while(spi->SYNCBUSY.reg){}
+	spi->INTENSET.bit.RXC = 1;
+	spi->CTRLA.reg |= 1<<1;
+	while(spi->SYNCBUSY.reg){}
+	NVIC->ISER[0] |= 1<<9;
+}
+
+/*
+*  Function configures BME slave, reads compensation values, forces a data read, stores data
+*  Reads of data and compensation values uses burst read
+*  compensation values are at 0x88 and 0xE1
+*  Data is stored at 0x72
+*/
+void spiWrite(void){
+	Sercom *ser = SERCOM0;
+	SercomSpi *spi = &(ser->SPI);
+	Port *por = PORT;
+	PortGroup *porA = &(por->Group[0]);
+	
+	/////////// READ COMPENSATION VALUES ////////////////////
+	
+	/* read group 1 compensation values */
+	porA->OUTCLR.reg = PORT_PA06; //pull down ss
+	
+	while(!(spi->INTFLAG.bit.DRE)){}	//read calibration values
+	spi->DATA.reg = 0x88; //calibration address
+	spi->CTRLB.bit.RXEN = 1;
+	while(spi->SYNCBUSY.reg){}
+	
+	/* loop for sending clk signals to BME slave for reading data */
+	while(done==0){
+		while(!(spi->INTFLAG.bit.DRE)){}
+		spi->DATA.reg = 0x00;
+		while(spi->INTFLAG.bit.RXC){}
+	}
+	cnt = 0;	//reset counter
+	done = 0;	//reset condition var
+	compensation_1();
+	wait(1);
+	
+	/* read group 2 compensation values */
+	porA->OUTCLR.reg = PORT_PA06; //pull down ss
+	while(!(spi->INTFLAG.bit.DRE)){}	//read calibration values
+	spi->DATA.reg = 0xE1; //calibration address
+	spi->CTRLB.bit.RXEN = 1;
+	while(spi->SYNCBUSY.reg){}
+	
+	/* loop for sending clk signals to BME slave for reading data */
+	while(done==0){
+		while(!(spi->INTFLAG.bit.DRE)){}
+		spi->DATA.reg = 0x00;
+		while(spi->INTFLAG.bit.RXC){}
+	}
+	cnt = 0;
+	done = 0;
+	compensation_2();
+	wait(1);
+	
+	/////////// READ DATA VALUES ////////////////////
+	porA->OUTCLR.reg = PORT_PA06; //pull down ss
+	
+	//set humidity oversampling to 1
+	spi->DATA.reg = 0x72;		//addr
+	while(!(spi->INTFLAG.bit.DRE)){}
+	spi->DATA.reg = 0x01;		//set oversampling = 1
+	
+	//take data, set temp/pressure oversampling to 1
+	while(!(spi->INTFLAG.bit.DRE)){}
+	spi->DATA.reg = 0x74;	//addr
+	while(!(spi->INTFLAG.bit.DRE)){}
+	spi->DATA.reg = 0x25;		//data
+	
+	//retake data for safety
+	while(!(spi->INTFLAG.bit.DRE)){}
+	spi->DATA.reg = 0x74;	//addr
+	while(!(spi->INTFLAG.bit.DRE)){}
+	spi->DATA.reg = 0x25;		//data
+	
+	/* cycles SS */
+	porA->OUTSET.reg = PORT_PA06; //pull up ss
+	wait(1);
+	porA->OUTCLR.reg = PORT_PA06; //pull down ss
+	
+	/* sets reading address */
+	while(!(spi->INTFLAG.bit.DRE)){}
+	spi->DATA.reg = 0xf7;
+	spi->CTRLB.bit.RXEN = 1;
+	while(spi->SYNCBUSY.reg){}
+	
+	/* loop for sending clk signals to BME slave for reading data */
+	while(done==0){
+		while(spi->INTFLAG.bit.RXC){}
+		spi->DATA.reg = 0x00;
+		while(spi->INTFLAG.bit.DRE){}
+	}
+	cnt = 0;
+	done = 0;
+	grab_data();
+	convert_data();
+}
+
+/*
+*  SPI handler for reading data from BME
+*/
+void SERCOM0_Handler(void){
+	Sercom *ser = SERCOM0;
+	SercomSpi *spi = &(ser->SPI);
+	Port *por = PORT;
+	PortGroup *porA = &(por->Group[0]);
+	
+	if (cnt>28){
+		porA->OUTSET.reg = PORT_PA06; //pull up ss
+		done = 1;
+		spi->CTRLB.bit.RXEN = 0;
+		while(spi->SYNCBUSY.reg){}
+	}
+	else {
+		array[cnt++] = spi->DATA.reg;
+	}
+}
+
+void wait(volatile int d){
+	int count = 0;
+	while (count < d*1000){
+		count++;
+	}
+}
+
+/*
+*  Function assigns the compensation values form group 1 read form BME to variables
+*  values fo  temperature, pressure and part of humidity
+*/
+void compensation_1(void){
+	/* temperature compensation values */
+	dig_T1 = array[2];
+	dig_T1 = dig_T1<<8;
+	dig_T1 |= array[1];
+	dig_T2 = array[4];
+	dig_T2 = dig_T2<<8;
+	dig_T2 |= array[3];
+	dig_T3 = array[6];
+	dig_T3 = dig_T3<<8;
+	dig_T3 |= array[5];
+	
+	/* pressure compensation values */
+	dig_P1 = array[8];
+	dig_P1 = dig_P1<<8;
+	dig_P1 |= array[7];
+	dig_P2 = array[10];
+	dig_P2 = dig_P2<<8;
+	dig_P2 |= array[9];
+	dig_P3 = array[12];
+	dig_P3 = dig_P3<<8;
+	dig_P3 |= array[11];
+	dig_P4 = array[14];
+	dig_P4 = dig_P4<<8;
+	dig_P4 |= array[13];
+	dig_P5 = array[16];
+	dig_P5 = dig_P5<<8;
+	dig_P5 |= array[15];
+	dig_P6 = array[18];
+	dig_P6 = dig_P6<<8;
+	dig_P6 |= array[17];
+	dig_P7 = array[20];
+	dig_P7 = dig_P7<<8;
+	dig_P7 |= array[19];
+	dig_P8 = array[22];
+	dig_P8 = dig_P8<<8;
+	dig_P8 |= array[21];
+	dig_P9 = array[24];
+	dig_P9 = dig_P9<<8;
+	dig_P9 |= array[23];
+	
+	/* humidiity compensation values */
+	dig_H1 = array[26];
+}
+
+/*
+*  Function assigns the compensation values form group 1 read form BME to variables
+*  Values for the remaing humidity
+*/
+void compensation_2(void){
+	volatile uint8_t temp = 0;
+	
+	/* humidiity compensation values */
+	dig_H2 = array[2];
+	dig_H2 = dig_H2<<8;
+	dig_H2 |= array[1];
+	dig_H3 = array[3];
+	
+	dig_H4 = array[4];
+	dig_H4 = dig_H4<<8;
+	temp = array[5];
+	temp = temp<<4;
+	dig_H4 |= temp;
+	dig_H4 = dig_H4>>4;
+	
+	dig_H5 = array[6];
+	dig_H5 = dig_H5<<8;
+	dig_H5 |= array[5];
+	dig_H5 = dig_H5>>4;
+	
+	dig_H6 = array[7];
+}
+
+/*
+* Function stores temperature, pressure, humidity data values from BME to appropriate variables
+*/
+void grab_data(void){
+	/* temperature data */
+	adc_T = array[4];
+	adc_T = adc_T<<8;
+	adc_T |= array[5];
+	adc_T = adc_T<<4;
+	
+	/* pressure data */
+	adc_P = array[1];
+	adc_P = adc_P<<8;
+	adc_P |= array[2];
+	adc_P = adc_P<<4;
+	
+	/* humidity data */
+	adc_H = array[7];
+	adc_H = adc_H<<8;
+	adc_H |= array[8];
+}
+
+/*
+*  Function takes compensation values, data values and converts them into readable data using compensation formulas
+*/
+void convert_data(void){
+	
+	volatile int var1;
+	volatile int var2;
+	volatile int t_fine;
+	
+	/* compensation formula for temperature (C) */
+	var1  = (((double)adc_T)/16384.0 - ((double)dig_T1)/1024.0) * ((double)dig_T2);
+	var2  = ((((double)adc_T)/131072.0 - ((double)dig_T1)/8192.0) * (((double)adc_T)/131072.0 - ((double) dig_T1)/8192.0)) * ((double)dig_T3);
+	t_fine = (bme)(var1 + var2);	//varuable used in pressure and humidty formula as well
+	T  = (var1 + var2) / 5120.0;
+	/* compensation formula for pressure (Pa) */
+	var1 = ((double)t_fine/2.0) - 64000.0;
+	var2 = var1 * var1 * ((double)dig_P6) / 32768.0;
+	var2 = var2 + var1 * ((double)dig_P5) * 2.0;
+	var2 = (var2/4.0)+(((double)dig_P4) * 65536.0);
+	var1 = (((double)dig_P3) * var1 * var1 / 524288.0 + ((double)dig_P2) * var1) / 524288.0;
+	var1 = (1.0 + var1 / 32768.0)*((double)dig_P1);
+	p = 1048576.0 - (double)adc_P;
+	p = (p - (var2 / 4096.0)) * 6250.0 / var1;
+	var1 = ((double)dig_P9) * p * p / 2147483648.0;
+	var2 = p * ((double)dig_P8) / 32768.0;
+	p = p + (var1 + var2 + ((double)dig_P7)) / 16.0;
+	
+	/* compensation formula for humidity (RH) */
+	h = (((double)t_fine)-76800.0);
+	h = (adc_H-(((double)dig_H4)*64.0+((double)dig_H5) / 16384.0 * h))*(((double)dig_H2)/65536.0*(1.0 + ((double)dig_H6)/67108864.0*h*(1.0+((double)dig_H3)/67108864.0*h)));
+	h = h * (1.0-((double)dig_H1)*h/524288.0);
+}
